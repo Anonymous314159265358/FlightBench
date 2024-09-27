@@ -1,0 +1,17 @@
+# Vehicle parameters
+inertia_x: 0.00586
+inertia_y: 0.006
+inertia_z: 0.00977
+arm_length: 0.125
+mass: 0.977
+# Motors parameters
+rotor_drag_coeff: 0.0178
+rotor_thrust_coeff: 8.54858e-06
+max_rotor_speed: 1356.6
+# Controller
+low_level_control_frequency: 200.0
+body_rates_p_xy: 0.13
+body_rates_d_xy: 0.86
+body_rates_p_z: 0.15
+body_rates_d_z: 0.38
+roll_pitch_cont_gain: 6.0

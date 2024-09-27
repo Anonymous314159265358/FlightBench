@@ -1,0 +1,137 @@
+#pragma once
+
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <string>
+
+#include <quadrotor_msgs/ControlCommand.h>
+#include <ros/ros.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float32.h>
+
+#include <mavros_msgs/State.h>
+#include <mavros_msgs/AttitudeTarget.h>
+#include <mavros_msgs/SetMode.h>
+#include <mavros_msgs/CommandLong.h>
+#include <mavros_msgs/CommandBool.h>
+
+#include "mavros_bridge/thrust_mapping.h"
+
+namespace mavros_bridge {
+  
+enum class ControlMode { NONE, ATTITUDE, BODY_RATES };
+enum class BridgeState { OFF, AUTONOMOUS_FLIGHT, RC_FLIGHT };
+enum class ThrustMappingMode { LINEAR, QUADRIC, ITERATIVE };
+
+class FCUStateData {
+ public:
+  mavros_msgs::State current_state;
+  mavros_msgs::State state_before_offboard;
+
+  FCUStateData() {};
+  void feed(mavros_msgs::StateConstPtr msg) {
+    current_state = *msg;
+  }
+};
+
+class MAVROSBridge {
+ public:
+  MAVROSBridge(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
+  MAVROSBridge() : MAVROSBridge(ros::NodeHandle(), ros::NodeHandle("~")) {}
+
+  virtual ~MAVROSBridge();
+
+ private:
+  // Paramters loader
+  bool loadParameters();
+
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+
+  BridgeState bridge_state_;
+  ControlMode control_mode_;
+
+  // Subscribers
+  ros::Subscriber control_command_sub_;
+  ros::Subscriber arm_bridge_sub_;
+  ros::Subscriber mavros_state_sub_;
+
+  void controlCommandCallback(
+      const quadrotor_msgs::ControlCommand::ConstPtr& msg);
+  void armBridgeCallback(const std_msgs::Bool::ConstPtr& msg);
+  void mavrosStateCallback(mavros_msgs::StateConstPtr msg);
+
+  void setBridgeState(const BridgeState& desired_bridge_state);
+
+  int arming_counter_;
+
+  // Publishers
+  ros::Publisher low_level_feedback_pub_;
+  ros::Publisher mavros_msg_pub_;
+
+  void publishAttitudeCommand(const quadrotor_msgs::ControlCommand::ConstPtr& msg);
+  void publishBodyRatesCommand(const quadrotor_msgs::ControlCommand::ConstPtr& msg);
+  void publishLowLevelFeedback(const ros::TimerEvent& time) const;
+
+  mavros_msgs::AttitudeTarget generateMAVROSMsgFromCTRL(
+      const quadrotor_msgs::ControlCommand::ConstPtr& msg, const ros::Time &stamp);
+  void sendMAVROSMessage(mavros_msgs::AttitudeTarget& msg);
+
+  // Timer
+  ros::Timer low_level_feedback_pub_timer_;
+
+  // Watch dog
+  
+  void watchdogThread(const ros::TimerEvent& time);
+
+  ros::Timer watchdog_timer_;
+  std::atomic_bool stop_watchdog_thread_;
+
+  ros::Time time_last_rc_msg_received_;
+  ros::Time time_last_mavros_msg_sent_;
+  ros::Time time_last_sbus_msg_sent_;
+  ros::Time time_last_active_control_command_received_;
+
+  // Safety flags
+  bool bridge_armed_;
+
+  mutable std::mutex main_mutex_;
+
+  // deconstruction
+  std::atomic_bool destructor_invoked_;
+
+  // thrust mapping
+  bool disable_thrust_mapping_;
+  // ThrustMappingMode thrust_mapping_mode_;
+  thrust_mapping::LinearMapping thrust_model_;
+
+  // related to flight controller unit (in fact, PX4 mini)
+  FCUStateData fcu_state_data_;
+
+  std::string quad_name_;
+  ros::ServiceClient set_FCU_mode_srv_;
+	ros::ServiceClient arm_FCU_srv_;
+
+  bool switchFCUArmState(bool to_arm);
+  bool switchFCUOffboardState(bool to_offboard);
+
+  // Parameters
+  double control_command_timeout_;
+  double rc_timeout_;
+
+  double mass_;
+
+  double max_roll_rate_;
+  double max_pitch_rate_;
+  double max_yaw_rate_;
+
+  double max_roll_angle_;
+  double max_pitch_angle_;
+
+  // Constants
+  static constexpr double kLowLevelFeedbackPublishFrequency_ = 50.0;
+
+};
+
+}  // namespace mavros_bridge

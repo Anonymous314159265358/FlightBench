@@ -1,0 +1,12 @@
+bool flag
+float32 z_min
+float32 z_max
+float32 x_min
+float32 x_max
+float32 y_min
+float32 y_max
+float32 v_max
+float32 omega_max
+float32 deltaq_max
+---
+bool res

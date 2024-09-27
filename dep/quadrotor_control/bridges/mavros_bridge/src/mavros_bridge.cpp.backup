@@ -1,0 +1,436 @@
+#include "mavros_bridge/mavros_bridge.h"
+
+#include <quadrotor_common/geometry_eigen_conversions.h>
+#include <quadrotor_common/math_common.h>
+#include <quadrotor_common/parameter_helper.h>
+#include <quadrotor_msgs/LowLevelFeedback.h>
+
+namespace mavros_bridge {
+
+MAVROSBridge::MAVROSBridge(const ros::NodeHandle& nh, const ros::NodeHandle& pnh)
+    : nh_(nh),
+      pnh_(pnh),
+      stop_watchdog_thread_(false),
+      time_last_rc_msg_received_(),
+      time_last_mavros_msg_sent_(ros::Time::now()),
+      time_last_active_control_command_received_(),
+      bridge_armed_(false),
+      destructor_invoked_(false),
+      control_mode_(ControlMode::NONE),
+      bridge_state_(BridgeState::OFF) {
+
+  if (!loadParameters()) {
+    ROS_ERROR("[%s] Could not load parameters.", pnh_.getNamespace().c_str());
+    ros::shutdown();
+    return;
+  }
+
+  // if (disable_thrust_mapping_) {
+  //   ROS_WARN("[%s] Thrust mapping disabled!", pnh_.getNamespace().c_str());
+  // }
+
+  // Publishers
+  low_level_feedback_pub_ =
+      nh_.advertise<quadrotor_msgs::LowLevelFeedback>("low_level_feedback", 1);
+  // NOTICE: since /mavros is not under the mavros_bridge node, 
+  // we need to use pnh_ as nodehandle rather than nh_. 
+  // Same in other parts.
+  mavros_msg_pub_ =
+      pnh_.advertise<mavros_msgs::AttitudeTarget>("/mavros/setpoint_raw/attitude", 10);
+  
+  // Subscribers
+  arm_bridge_sub_ = nh_.subscribe(
+      "mavros_bridge/arm", 1, &MAVROSBridge::armBridgeCallback, this);
+  control_command_sub_ = nh_.subscribe(
+      "control_command", 1, &MAVROSBridge::controlCommandCallback, this);
+  mavros_state_sub_ = pnh_.subscribe(
+      "/mavros/state", 10, &MAVROSBridge::mavrosStateCallback, this);
+    
+  low_level_feedback_pub_timer_ = nh_.createTimer(
+      ros::Duration(1.0 / kLowLevelFeedbackPublishFrequency_),
+      &MAVROSBridge::publishLowLevelFeedback, this);
+
+  // Service clients
+  set_FCU_mode_srv_ = pnh_.serviceClient<mavros_msgs::SetMode>("/"+quad_name_+"/mavros/set_mode");
+  arm_FCU_srv_ = pnh_.serviceClient<mavros_msgs::CommandBool>("/"+quad_name_+"/mavros/cmd/arming");
+
+  //watchdog_timer_ = nh_.createTimer(ros::Duration(1.0 / 100),&MAVROSBridge::watchdogThread, this);
+
+}
+
+// done
+MAVROSBridge::~MAVROSBridge() {
+  destructor_invoked_ = true;
+
+  // Stop watchdog thread
+  stop_watchdog_thread_ = true;
+  // Wait for watchdog thread to finish
+  // watchdog_thread_.join();
+
+  setBridgeState(BridgeState::OFF);
+
+  if (switchFCUArmState(false)) {
+    switchFCUOffboardState(false);
+  }
+
+}
+
+// done, except battery check
+void MAVROSBridge::watchdogThread(const ros::TimerEvent& time) {
+  if (ros::ok() && !stop_watchdog_thread_) {
+    std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+    const ros::Time time_now = ros::Time::now();
+
+    // TODO: fix this part:
+    // mavros will still publish wrong rc messages although no RC is connected
+    //   check which rc we need: in or out?
+    // 
+    // if (bridge_state_ == BridgeState::RC_FLIGHT &&
+    //     time_now - time_last_rc_msg_received_ > ros::Duration(rc_timeout_)) { 
+    //   ROS_WARN(
+    //       "[%s] Remote control was active but no message from it was received "
+    //       "within timeout (%f s).",
+    //       pnh_.getNamespace().c_str(), rc_timeout_);
+    //   setBridgeState(BridgeState::AUTONOMOUS_FLIGHT);
+    // }
+
+    if (bridge_state_ == BridgeState::AUTONOMOUS_FLIGHT) {
+      if (time_now - time_last_active_control_command_received_ >
+          ros::Duration(control_command_timeout_)) {
+        // When switching the bridge state to off, our watchdog ensures that a
+        // disarming off message is repeated.
+        setBridgeState(BridgeState::OFF);
+        // Note: Control could theoretically still be taken over by RC but if
+        // this happened in flight it might require super human reaction since
+        // in this case the quad can not be armed with non zero throttle by
+        // the remote.
+      }
+    }
+
+    if (bridge_state_ == BridgeState::OFF) {
+      if (switchFCUArmState(false)) {
+        switchFCUOffboardState(false);
+      }
+    }
+
+    // Mutexes are unlocked because they go out of scope here
+  }
+
+}
+
+// done
+void MAVROSBridge::setBridgeState(const BridgeState& desired_bridge_state) {
+  switch (desired_bridge_state) {
+    case BridgeState::OFF:
+      ROS_INFO("[mavros_bridge] SET TO OFF");
+      bridge_state_ = desired_bridge_state;
+      if (switchFCUArmState(false)) {
+        switchFCUOffboardState(false);
+      }
+      break;
+
+    case BridgeState::AUTONOMOUS_FLIGHT:
+      ROS_INFO("[mavros_bridge] SET TO AUTO");
+      bridge_state_ = desired_bridge_state;
+      if (switchFCUArmState(true)) {
+        switchFCUOffboardState(true);
+      }
+      break;
+
+    case BridgeState::RC_FLIGHT:
+      ROS_INFO("[mavros_bridge] SET TO RC");
+      bridge_state_ = desired_bridge_state;
+      if (switchFCUArmState(true)) {
+        switchFCUOffboardState(false);
+      }
+      break;
+
+    default:
+      ROS_WARN("[%s] Wanted to switch to unknown bridge state",
+               pnh_.getNamespace().c_str());
+  }
+}
+
+// done
+void MAVROSBridge::mavrosStateCallback(mavros_msgs::StateConstPtr msg) {
+  std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+  if (destructor_invoked_) {
+    // On shut down we do not allow to arm (or disarm) the bridge anymore
+    return;
+  }
+
+  fcu_state_data_.feed(msg);
+}
+
+// done
+void MAVROSBridge::armBridgeCallback(const std_msgs::Bool::ConstPtr& msg) {
+  std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+  if (destructor_invoked_) {
+    // On shut down we do not allow to arm (or disarm) the bridge anymore
+    ROS_INFO("Mavros Bridge has been shut down!");
+    return;
+  }
+
+  if (msg->data) {
+    bridge_armed_ = true;
+    ROS_INFO("[%s] Bridge armed", pnh_.getNamespace().c_str());
+  } else {
+    bridge_armed_ = false;
+    if (bridge_state_ == BridgeState::AUTONOMOUS_FLIGHT) {
+      setBridgeState(BridgeState::OFF);
+    }
+    ROS_INFO("[%s] Bridge disarmed", pnh_.getNamespace().c_str()); 
+  }
+}
+
+void MAVROSBridge::controlCommandCallback(
+    const quadrotor_msgs::ControlCommand::ConstPtr& msg) {
+  std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+  if (destructor_invoked_) {
+    // This ensures that if the destructor was invoked we do not try to write
+    // to the serial port anymore because of receiving a control command
+    return;
+  }
+
+  ros::Time now_time = ros::Time::now();
+
+  if (msg->armed) {
+    // We only need to know when the last active control command was received.
+    // If it is not active, the bridge state will go to off and we keep sending
+    // an off command with every new control command received.
+    // This prevents the flight controller from going into failsafe
+    time_last_active_control_command_received_ = now_time;
+  }
+
+  if (!bridge_armed_ || bridge_state_ == BridgeState::RC_FLIGHT) {
+    // If bridge is not armed we do not allow control commands to be sent
+    // RC has priority over control commands for autonomous flying
+    if (!bridge_armed_ && msg->armed &&
+        bridge_state_ != BridgeState::RC_FLIGHT) {
+      ROS_WARN_THROTTLE(
+          1.0,
+          "[%s] Received active control command but mavros bridge is not armed.",
+          pnh_.getNamespace().c_str());
+    }
+    return;
+  }
+
+  mavros_msgs::AttitudeTarget mavros_msg_to_send;
+  mavros_msg_to_send = generateMAVROSMsgFromCTRL(msg, now_time);
+
+  // Set to arming state or ensure disarmed command if necessary
+  if (msg->armed) {
+    if (bridge_state_ != BridgeState::AUTONOMOUS_FLIGHT) {
+      if (msg->control_mode == msg->ATTITUDE ||
+          msg->control_mode == msg->BODY_RATES) {
+        setBridgeState(BridgeState::AUTONOMOUS_FLIGHT);
+      } else {
+        ROS_WARN_THROTTLE(
+            1.0,
+            "[%s] Received active control command with unsupported control "
+            "mode, mavros bridge will not arm. Supported control modes are "
+            "ATTITUDE and BODY_RATES",
+            pnh_.getNamespace().c_str());
+      }
+    }
+  } else {
+    if (bridge_state_ == BridgeState::AUTONOMOUS_FLIGHT) {
+      setBridgeState(BridgeState::OFF);
+    }
+    switchFCUArmState(false);
+    // TODO: setThrottleCommand(kMinCmd); (not necessary but for safety)
+  }
+
+  sendMAVROSMessage(mavros_msg_to_send);
+
+  // Set control mode for low level feedback message to be published
+  if (msg->control_mode == msg->ATTITUDE) {
+    control_mode_ = ControlMode::ATTITUDE;
+  } else if (msg->control_mode == msg->BODY_RATES) {
+    control_mode_ = ControlMode::BODY_RATES;
+  } else {
+    control_mode_ = ControlMode::NONE;
+  }
+
+  // Main mutex is unlocked because it goes out of scope here
+}
+
+void MAVROSBridge::sendMAVROSMessage(mavros_msgs::AttitudeTarget& msg) {
+  mavros_msgs::AttitudeTarget mavros_msg_to_send = msg;
+
+  /*
+  switch (bridge_state_) {
+    case BridgeState::OFF:
+      if (switchFCUArmState(false)) {
+        switchFCUOffboardState(false);
+      }
+      break;
+    
+    case BridgeState::AUTONOMOUS_FLIGHT:
+      if (switchFCUArmState(true)) {
+        switchFCUOffboardState(true);
+      }
+      break;
+
+    case BridgeState::RC_FLIGHT:
+      break;
+    
+    default:
+      if (switchFCUArmState(false)) {
+        switchFCUOffboardState(false);
+      }
+      ROS_WARN("[%s] Bridge is in unknown state, vehicle will be disarmed",
+               pnh_.getNamespace().c_str());
+      break;
+  }
+  */
+
+  ros::Time now_time = ros::Time::now();
+  msg.header.stamp = now_time;
+  mavros_msg_pub_.publish(msg);
+  time_last_mavros_msg_sent_ = now_time;
+
+}
+
+void MAVROSBridge::publishLowLevelFeedback(const ros::TimerEvent& time) const {
+  quadrotor_msgs::LowLevelFeedback low_level_feedback_msg;
+
+  {
+    std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+    // Publish a low level feedback message
+    low_level_feedback_msg.header.stamp = ros::Time::now();
+
+    if (bridge_state_ == BridgeState::RC_FLIGHT) {
+      low_level_feedback_msg.control_mode = low_level_feedback_msg.RC_MANUAL;
+    } else {
+      if (control_mode_ == ControlMode::ATTITUDE) {
+        low_level_feedback_msg.control_mode = low_level_feedback_msg.ATTITUDE;
+      } else if (control_mode_ == ControlMode::BODY_RATES) {
+        low_level_feedback_msg.control_mode = low_level_feedback_msg.BODY_RATES;
+      } else {
+        low_level_feedback_msg.control_mode = low_level_feedback_msg.NONE;
+      }
+    }
+
+    // Mutexes are unlocked here since they go out of scope
+  }
+
+  low_level_feedback_pub_.publish(low_level_feedback_msg);
+}
+
+mavros_msgs::AttitudeTarget MAVROSBridge::generateMAVROSMsgFromCTRL(
+    const quadrotor_msgs::ControlCommand::ConstPtr& ctrl_msg, const ros::Time &stamp) {
+  mavros_msgs::AttitudeTarget msg;
+  
+  msg.header.stamp = stamp;
+	msg.header.frame_id = std::string("FCU");
+
+  msg.thrust = thrust_model_.calculateControl(ctrl_msg);
+
+  if (ctrl_msg->control_mode == ctrl_msg->BODY_RATES){
+    msg.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ATTITUDE;
+
+    msg.body_rate.x = ctrl_msg->bodyrates.x;
+    msg.body_rate.y = ctrl_msg->bodyrates.y;
+    msg.body_rate.z = ctrl_msg->bodyrates.z;
+
+  } else if (ctrl_msg->control_mode == ctrl_msg->ATTITUDE) {
+    msg.type_mask = mavros_msgs::AttitudeTarget::IGNORE_ROLL_RATE |
+                    mavros_msgs::AttitudeTarget::IGNORE_PITCH_RATE |
+                    mavros_msgs::AttitudeTarget::IGNORE_YAW_RATE;
+
+    msg.orientation.x = ctrl_msg->orientation.x;
+    msg.orientation.y = ctrl_msg->orientation.y;
+    msg.orientation.z = ctrl_msg->orientation.z;
+    msg.orientation.w = ctrl_msg->orientation.w;
+
+  } else {
+    ROS_ERROR("Invalid control mode, please use bodyrates or attitude!");
+  }
+
+  return msg;
+
+}
+
+bool MAVROSBridge::switchFCUArmState(bool to_arm) {
+  std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+  mavros_msgs::CommandBool arm_cmd;
+	arm_cmd.request.value = to_arm;
+	if (!(arm_FCU_srv_.call(arm_cmd) && arm_cmd.response.success))
+	{
+		if (to_arm)
+			ROS_ERROR("ARM rejected by PX4!");
+		else
+			ROS_ERROR("DISARM rejected by PX4!");
+
+		return false;
+	}
+
+	return true;
+}
+
+bool MAVROSBridge::switchFCUOffboardState(bool to_offboard) {
+  std::lock_guard<std::mutex> main_lock(main_mutex_);
+
+  mavros_msgs::SetMode offboard_set_mode;
+
+	if (to_offboard) {
+		fcu_state_data_.state_before_offboard = fcu_state_data_.current_state;
+		if (fcu_state_data_.state_before_offboard.mode == "OFFBOARD") // Not allowed
+			fcu_state_data_.state_before_offboard.mode = "MANUAL";
+
+		offboard_set_mode.request.custom_mode = "OFFBOARD";
+		if (!(set_FCU_mode_srv_.call(offboard_set_mode) && offboard_set_mode.response.mode_sent)) {
+			ROS_ERROR("Enter OFFBOARD rejected by PX4!");
+			return false;
+		}
+	} else {
+		offboard_set_mode.request.custom_mode = fcu_state_data_.state_before_offboard.mode;
+		if (!(set_FCU_mode_srv_.call(offboard_set_mode) && offboard_set_mode.response.mode_sent)) {
+			ROS_ERROR("Exit OFFBOARD rejected by PX4!");
+			return false;
+		}
+	}
+
+	return true;
+
+}
+
+bool MAVROSBridge::loadParameters() {
+#define GET_PARAM(name) \
+  if (!quadrotor_common::getParam(#name, name##_, pnh_)) return false
+
+  if (!pnh_.getParam("quad_name", quad_name_)) return false;
+
+  GET_PARAM(control_command_timeout);
+  GET_PARAM(rc_timeout);
+
+  GET_PARAM(mass);
+
+  GET_PARAM(max_roll_rate);
+  GET_PARAM(max_pitch_rate);
+  GET_PARAM(max_yaw_rate);
+  max_roll_rate_ /= (180.0 / M_PI);
+  max_pitch_rate_ /= (180.0 / M_PI);
+  max_yaw_rate_ /= (180.0 / M_PI);
+
+  GET_PARAM(max_roll_angle);
+  GET_PARAM(max_pitch_angle);
+  max_roll_angle_ /= (180.0 / M_PI);
+  max_pitch_angle_ /= (180.0 / M_PI);
+
+  thrust_model_.param_.readConfigFromROSHandle(pnh_);
+  thrust_model_.resetThrustMapping();
+
+  return true;
+
+#undef GET_PARAM
+}
+
+}

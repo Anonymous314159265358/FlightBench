@@ -1,0 +1,17 @@
+*.o
+*.obj.npy
+.vscode/
+main
+obj/
+sbpy/
+path_dense.csv
+path.csv
+samples.csv
+samples_pmm.csv
+tree.csv
+open_list.csv
+roadmap_*.csv
+results.log
+min_time_py/
+maps/*
+res/*

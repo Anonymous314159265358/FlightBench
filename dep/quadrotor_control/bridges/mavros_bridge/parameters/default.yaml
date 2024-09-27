@@ -1,0 +1,21 @@
+#########################################################################
+# ⭐⭐⭐  Set parameters carefully for satisfied performance!   ⭐⭐⭐ #
+#########################################################################
+
+mass                    : 1.0 # kg
+gravity                 : 9.81 # m/s^2
+control_command_timeout : 0.5 # [s] (Must be larger than 'state_estimate_timeout' set in the 'flight_controller'!)
+feedback_msg_timeout    : 1.5 # [s]
+rc_timeout              : 0.1 # [s]
+
+# Maximum values for body rates and roll and pitch angles as they are set
+# on the Flight Controller. The max roll an pitch angles are only active
+# when flying in angle mode
+max_roll_rate           : 1022.0 # [deg/s]
+max_pitch_rate          : 1022.0 # [deg/s]
+max_yaw_rate            : 524.0 # [deg/s]
+max_roll_angle          : 50 # [deg]
+max_pitch_angle         : 50 # [deg]
+
+thrust_model:
+  hover_percentage      : 0.27 # Thrust percentage in Stabilize/Arco mode # *
